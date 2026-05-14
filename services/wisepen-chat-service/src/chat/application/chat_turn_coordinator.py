@@ -1,4 +1,5 @@
 from typing import Optional, List, Dict, Any
+import re
 from fastapi import BackgroundTasks
 from common.logger import log_error, log_ok
 
@@ -71,6 +72,8 @@ class ChatTurnCoordinator:
             background_tasks: BackgroundTasks,
             model_id: Optional[int] = None,
             states: Optional[List[Dict[str, Any]]] = None,
+            attachment_refs: Optional[List[Dict[str, Any]]] = None,
+            resource_refs: Optional[List[Dict[str, Any]]] = None,
     ):
         model_id = model_id or settings.DEFAULT_MODEL_ID
 
@@ -94,42 +97,79 @@ class ChatTurnCoordinator:
         tool_context: dict[str, Any] = {
             "session_id": session_id,
             "user_id": user_id,
-        } 
+        }
 
-        # [Skill Match] 预筛当前 query 可能相关的 Skill，命中才暴露 schema + 注入 Available Skills
-        candidate_skills = self._skill_matcher.match(user_query)
+        # [Skill Match] 三种触发方式合并：
+        #   ① @skill:xxx 命令（最高优先级）→ 从 query 中解析并剥离
+        #   ② active_skill states（UI 点击选择）→ 显式指定 Skill
+        #   ③ 关键词自动匹配（语义匹配兜底）
+        explicit_skills: List[SkillMeta] = []
+        clean_query = user_query
+
+        # ① 解析 @skill:name 命令
+        skill_cmd_match = re.search(r'@skill:(\S+)', user_query)
+        if skill_cmd_match:
+            skill_name = skill_cmd_match.group(1)
+            found = self._skill_matcher.lookup_by_name(skill_name)
+            if found:
+                explicit_skills.append(found)
+                clean_query = re.sub(r'@skill:\S+[  ]*', '', user_query).strip()
+
+        # ② 从 states 中提取 active_skill（仅当 @skill 未命中时，避免覆盖命令）
+        if not explicit_skills and states:
+            for s in states:
+                if s.get("key") == "active_skill" and not s.get("disabled", False) and s.get("value"):
+                    skill_id = s["value"].strip()
+                    found = self._skill_matcher.lookup(skill_id)
+                    if found:
+                        explicit_skills.append(found)
+                    break
+
+        # ③ 关键词匹配（在剥离 @skill 后的 clean_query 上执行）
+        keyword_candidates = self._skill_matcher.match(clean_query)
+
+        # 合并：显式 Skill 排在最前，关键词匹配的排在后面（去重）
+        seen_ids: set[str] = set()
+        candidate_skills: List[SkillMeta] = []
+        for m in explicit_skills + keyword_candidates:
+            if m.skill_id not in seen_ids:
+                seen_ids.add(m.skill_id)
+                candidate_skills.append(m)
+
+        # 如果 @skill 剥离后 query 为空，补一个兜底提示
+        if not clean_query:
+            clean_query = "请根据加载的 Skill 执行任务。"
+
         expose_tool_name_set = None
         if candidate_skills:
-            # 解禁 Registry 里默认隐藏的 skill 脚手架工具（reserved=True）
             expose_tool_name_set = set(_SKILL_TOOL_NAMES)
             tool_context["allowed_skill_ids"] = [s.skill_id for s in candidate_skills]
 
         # [Tool Scope] 派生本请求的工具视图快照
-        # expose_tool_name_set 仅在 skill 命中时解禁 load_skill 系列，未命中时它们保持隐藏
-        # runtime_discovered_tools 预留给"运行时动态发现的工具"（如 Skill bundle 自带 tools），暂时留空
-        # allow_tool_name_set/deny_tool_name_set 预留给未来"用户级工具偏好"接入，暂时留空
         tool_scope = self._tool_registry.derive(
             session_id=session_id,
-            tool_context=tool_context, 
+            tool_context=tool_context,
             runtime_discovered_tools=None,
             expose_tool_name_set=expose_tool_name_set,
             allow_tool_name_set=None,
             deny_tool_name_set=None,
         )
 
-        # [Context Construction] 将系统提示词、Mem0 检索到的事实、会话的历史摘要、前端上下文以及窗口内的明细消息组装成 LLM 所需的格式
+        # [Context Construction]
         messages_for_llm = self._context_assembler.assemble_prompt(
-            session_id, user_query, messages_keep+messages_compress_candidates, relevant_facts, session_summary,
+            session_id, clean_query, messages_keep+messages_compress_candidates, relevant_facts, session_summary,
             states=states,
             candidate_skills=candidate_skills or None,
+            attachment_refs=attachment_refs,
+            resource_refs=resource_refs,
         )
 
         # 记录进入 Agent 循环前的列表长度
         original_msg_count = len(messages_for_llm)
 
-        # 在流式推理之前构造 user_msg，确保 created_at 早于所有中间消息
+        # user_msg 使用剥离 @skill 后的 clean_query 持久化
         user_msg = ChatMessage(
-            session_id=session_id, role=Role.USER, content=user_query,
+            session_id=session_id, role=Role.USER, content=clean_query,
             metadata={"states": states} if states else {},
         )
 
@@ -183,7 +223,7 @@ class ChatTurnCoordinator:
             )
             background_tasks.add_task(
                 self._turn_finalizer.auto_generate_title,
-                session_id, user_id, user_query
+                session_id, user_id, clean_query
             )
             if needs_compression:
                 background_tasks.add_task(

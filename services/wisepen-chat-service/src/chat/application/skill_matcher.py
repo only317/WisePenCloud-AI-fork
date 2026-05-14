@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List
+from typing import Dict, List, Optional
 
 from common.logger import log_error, log_fail, log_event
 
@@ -21,30 +21,65 @@ class SkillMatcher(ABC):
     @abstractmethod
     def match(self, query: str) -> List[SkillMeta]: ...
 
+    @abstractmethod
+    def lookup(self, skill_id: str) -> Optional[SkillMeta]:
+        """按 skill_id 精确查找（供 states/命令 显式指定 Skill 使用）"""
+        ...
+
+    @abstractmethod
+    def lookup_by_name(self, name: str) -> Optional[SkillMeta]:
+        """按 skill_id 或 display_name 模糊查找（供 @skill:xxx 命令解析使用）"""
+        ...
+
 
 class KeywordSkillMatcher(SkillMatcher):
     """
-    最简关键词预筛：大小写无关 substring 匹配 triggers，按命中数排序取 top_k。
+    关键词预筛 + 精确查找：大小写无关 substring 匹配 triggers，按命中数排序取 top_k。
+    同时维护 skill_id → SkillMeta 索引，支持显式指定 Skill 时 O(1) 查找。
     """
 
     def __init__(self, skill_repo: SkillRepository) -> None:
         self._skill_repo = skill_repo
         self._cache: List[SkillMeta] = []
+        self._cache_by_id: Dict[str, SkillMeta] = {}
         self._warmed: bool = False
 
     async def warmup(self) -> None:
         try:
             metas = await self._skill_repo.list_enabled_meta()
         except Exception as e:
-            # 捕获所有异常，保证服务可启动 / 周期刷新不炸
-            # 失败时不擦除 self._cache，已有 last-good 继续服务，防止被 Mongo 抖动打回"无 Skill 能力"
             log_error("Skill matcher warmup", e, had_cache=bool(self._cache))
             self._warmed = True
             return
 
         self._cache = metas
+        self._cache_by_id = {m.skill_id: m for m in metas}
         self._warmed = True
         log_event("Skill matcher warmup 完成", count=len(metas))
+
+    def lookup(self, skill_id: str) -> Optional[SkillMeta]:
+        if not skill_id:
+            return None
+        meta = self._cache_by_id.get(skill_id)
+        if meta:
+            return meta
+        lowered = skill_id.lower()
+        for m in self._cache:
+            if m.skill_id.lower() == lowered:
+                return m
+        return None
+
+    def lookup_by_name(self, name: str) -> Optional[SkillMeta]:
+        if not name:
+            return None
+        exact = self.lookup(name)
+        if exact:
+            return exact
+        lowered = name.lower()
+        for m in self._cache:
+            if lowered in m.display_name.lower():
+                return m
+        return None
 
     def match(self, query: str) -> List[SkillMeta]:
         if not self._cache:

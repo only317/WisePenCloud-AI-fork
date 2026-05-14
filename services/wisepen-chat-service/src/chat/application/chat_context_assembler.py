@@ -7,6 +7,10 @@ from chat.domain.entities.skill import SkillMeta
 from chat.domain.repositories import MessageRepository, HotContextRepository, SessionRepository
 
 
+# 前端 states 中属于内部控制的 key，不应作为上下文注入 LLM
+_INTERNAL_STATE_KEYS = frozenset({"active_skill", "skill_version"})
+
+
 class ChatContextAssembler:
     """负责短期上下文的全生命周期管理：Redis 热缓存读取与降级回填、上下文裁剪、Prompt 组装"""
 
@@ -99,6 +103,8 @@ class ChatContextAssembler:
         session_summary: Optional[str],
         states: Optional[List[Dict[str, Any]]] = None,
         candidate_skills: Optional[List[SkillMeta]] = None,
+        attachment_refs: Optional[List[Dict[str, Any]]] = None,
+        resource_refs: Optional[List[Dict[str, Any]]] = None,
     ) -> List[ChatMessage]:
         """组装最终发往 LLM 的消息列表。"""
         system_prompt = """
@@ -161,14 +167,42 @@ class ChatContextAssembler:
         # 经过滑动窗口裁剪后的近期对话明细
         messages.extend(windowed_messages)
 
-        # 前端上下文注入：作为独立 SYSTEM 消息插入在历史消息和用户问题之间
-        active_states = [s for s in (states or []) if not s.get("disabled", False) and s.get("value")]
+        # 前端上下文注入：过滤掉内部控制信号（active_skill / skill_version 走 Skill 匹配通道）
+        active_states = [s for s in (states or [])
+                         if not s.get("disabled", False)
+                         and s.get("value")
+                         and s.get("key") not in _INTERNAL_STATE_KEYS]
         if active_states:
             ctx_lines = [f'<context key="{s["key"]}">\n{s["value"]}\n</context>' for s in active_states]
             messages.append(ChatMessage(
                 session_id=session_id,
                 role=Role.SYSTEM,
                 content="[Frontend Context]\n" + "\n".join(ctx_lines),
+            ))
+
+        # 附件/文档引用注入：告知 LLM 用户附加了哪些文件
+        # TODO: 等 Java 附件上传接口就绪后，根据 attachment_id 拉取文件内容注入
+        enabled_attachments = [a for a in (attachment_refs or []) if a.get("enabled", True)]
+        enabled_resources = [r for r in (resource_refs or []) if r.get("enabled", True)]
+        if enabled_attachments:
+            lines = []
+            for a in enabled_attachments:
+                label = a.get("filename") or a["attachment_id"]
+                lines.append(f"- {label} (id: {a['attachment_id']})")
+            messages.append(ChatMessage(
+                session_id=session_id,
+                role=Role.SYSTEM,
+                content="[Attached Files]\nThe user has attached the following files. "
+                        "Acknowledge them in your response where relevant:\n"
+                        + "\n".join(lines),
+            ))
+        if enabled_resources:
+            ids = [r["resource_id"] for r in enabled_resources]
+            messages.append(ChatMessage(
+                session_id=session_id,
+                role=Role.SYSTEM,
+                content="[Referenced Resources]\nThe user has referenced the following resources:\n"
+                        + "\n".join(f"- resource_id: {i}" for i in ids),
             ))
 
         # 用户最新输入的问题

@@ -14,4 +14,8 @@ class ChatRequest(BaseModel):
 
     states: Optional[List[Dict[str, Any]]] = Field(default=None, description="上下文状态列表")
 
+    attachment_refs: Optional[List[Dict[str, Any]]] = Field(default=None, description="附件引用列表")
+
+    resource_refs: Optional[List[Dict[str, Any]]] = Field(default=None, description="资源/文档引用列表")
+
     model_config = {"extra": "ignore"}

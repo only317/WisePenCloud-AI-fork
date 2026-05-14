@@ -23,6 +23,7 @@ from chat.api.endpoints import chat as chat_endpoints
 from chat.api.endpoints import session as session_endpoints
 from chat.api.endpoints import memory as memory_endpoints
 from chat.api.endpoints import model as model_endpoints
+from chat.api.endpoints import skill as skill_endpoints
 from chat.domain.entities import ChatSession, ChatMessage, Provider, Model, ModelProviderMapping, Skill
 
 
@@ -107,7 +108,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log_error("Nacos 服务注销", e)
 
-container.wire(modules=[chat_endpoints, session_endpoints, memory_endpoints, model_endpoints])  # 注入依赖到路由模块
+container.wire(modules=[chat_endpoints, session_endpoints, memory_endpoints, model_endpoints, skill_endpoints])  # 注入依赖到路由模块
 app = FastAPI(title=bootstrap_settings.APP_NAME, lifespan=lifespan, docs_url="/docs")
 
 # CORS 中间件
@@ -127,6 +128,7 @@ setup_global_exception_handlers(app, is_dev=bootstrap_settings.IS_DEV)
 
 # 挂载业务路由
 app.include_router(api_router, prefix="/chat")
+app.include_router(skill_endpoints.router, prefix="/skill")
 
 if __name__ == "__main__":
     uvicorn.run(
